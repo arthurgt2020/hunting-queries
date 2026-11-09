@@ -1,0 +1,145 @@
+// ===== H1 Exposure - PHP runtimes and PHP2Shell CVEs (MDVM)
+// Part A: devices where Defender Vulnerability Management already maps the CVEs (may be empty while MDVM catches up)
+DeviceTvmSoftwareVulnerabilities
+| where CveId in ("CVE-2026-109618", "CVE-2026-109619")
+| summarize CVEs = make_set(CveId), Software = make_set(strcat(SoftwareName, " ", SoftwareVersion), 20) by DeviceId, DeviceName, OSPlatform
+| join kind=leftouter (
+    DeviceTvmSoftwareInventory
+    | where SoftwareName matches regex @"(?i)^php"
+    | summarize PhpPackages = make_set(strcat(SoftwareName, " ", SoftwareVersion), 20) by DeviceId
+  ) on DeviceId
+| project DeviceName, OSPlatform, CVEs, Software, PhpPackages
+// ===== H1b Exposure - PHP versions below the fixed builds (upstream versioning)
+// Distro backports keep old version strings: confirm patch status from the package changelog, not this flag alone
+DeviceTvmSoftwareInventory
+| where SoftwareName matches regex @"(?i)^php([0-9]+(\.[0-9]+)?)?(-(cli|fpm|cgi|common))?(_for_linux)?$"
+| extend Ver = extract(@"^(?:\d+:)?(\d+\.\d+\.\d+)", 1, SoftwareVersion)
+| extend Major = toint(split(Ver, ".")[0]), Minor = toint(split(Ver, ".")[1]), Patch = toint(split(Ver, ".")[2])
+| extend Status = case(
+    isempty(Ver), "Unknown version - check manually",
+    Major < 8 or (Major == 8 and Minor <= 1), "EOL branch - backport or upgrade",
+    Major == 8 and Minor == 2 and Patch < 35, "Below 8.2.35",
+    Major == 8 and Minor == 3 and Patch < 36, "Below 8.3.36",
+    Major == 8 and Minor == 4 and Patch < 27, "Below 8.4.27",
+    Major == 8 and Minor == 5 and Patch < 12, "Below 8.5.12",
+    "At or above fixed build")
+| where Status != "At or above fixed build"
+| summarize Devices = dcount(DeviceId), DeviceList = make_set(DeviceName, 100) by SoftwareName, SoftwareVersion, Status
+| order by Devices desc
+// ===== H1c Internet-facing Windows/IIS hosts running php-cgi.exe below the PHP2Shell fixed builds (adapted from Sergio Albea)
+let InternetFacingDevices = DeviceInfo
+    | where Timestamp > ago(7d)
+    | summarize arg_max(Timestamp, IsInternetFacing, PublicIP) by DeviceId
+    | where IsInternetFacing == true          // comment out to see all hosts, with the flag as a column
+    | project DeviceId, IsInternetFacing, PublicIP;
+let LatestInstalledPHP = DeviceTvmSoftwareInventory
+    | where SoftwareName matches regex @"(?i)^php"
+    | summarize InstalledPHP = make_set(SoftwareVersion, 10) by DeviceId;
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("php-cgi.exe", "php.exe")
+| extend PathVersion = extract(@"(?i)\\v?(\d+\.\d+(?:\.\d+)?)\\php(-cgi)?\.exe$", 1, FolderPath)
+| extend PHPVersion = coalesce(extract(@"^(\d+\.\d+\.\d+)", 1, ProcessVersionInfoProductVersion), PathVersion)
+| extend Major = toint(split(PHPVersion, ".")[0]), Minor = toint(split(PHPVersion, ".")[1]), Patch = toint(split(PHPVersion, ".")[2])
+| extend Status = case(
+    isempty(PHPVersion), "Unknown version - check binary",
+    Major < 8 or (Major == 8 and Minor <= 1), "EOL branch",
+    Major == 8 and Minor == 2 and (isnull(Patch) or Patch < 35), "Below 8.2.35 or patch unknown",
+    Major == 8 and Minor == 3 and (isnull(Patch) or Patch < 36), "Below 8.3.36 or patch unknown",
+    Major == 8 and Minor == 4 and (isnull(Patch) or Patch < 27), "Below 8.4.27 or patch unknown",
+    Major == 8 and Minor == 5 and (isnull(Patch) or Patch < 12), "Below 8.5.12 or patch unknown",
+    "At or above fixed build")
+| where Status != "At or above fixed build"
+| join kind=inner InternetFacingDevices on DeviceId
+| join kind=leftouter LatestInstalledPHP on DeviceId
+| summarize FirstExecution = min(Timestamp), LastExecution = max(Timestamp), Executions = count(),
+    ProcessPaths = make_set(FolderPath, 10), IISCommandLines = make_set(InitiatingProcessCommandLine, 10)
+    by DeviceName, PublicIP, PHPVersion, Status, InstalledPHP = tostring(InstalledPHP)
+| order by Status asc, Executions desc
+// ===== H2 PHP or web worker spawning shells, interpreters or download tools
+let lookback = datetime(2026-10-20T00:00:00Z);
+let WebParents = @"(?i)^(php(-fpm|-cgi)?[0-9.]*(\.exe)?|httpd|apache2|nginx|lsphp[0-9]*|frankenphp|w3wp\.exe)$";
+let Children = dynamic(["sh","bash","dash","zsh","busybox","cmd.exe","powershell.exe","pwsh.exe","python","python3","python.exe","perl","curl","curl.exe","wget","nc","ncat","socat","certutil.exe","bitsadmin.exe"]);
+DeviceProcessEvents
+| where Timestamp >= lookback
+| where InitiatingProcessFileName matches regex WebParents
+| where FileName in~ (Children)
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine, FolderPath, SHA256
+| order by Timestamp desc
+// ===== H3 Reverse-shell and recon command lines run as the web worker
+let lookback = datetime(2026-10-20T00:00:00Z);
+let WebParents = @"(?i)^(php(-fpm|-cgi)?[0-9.]*(\.exe)?|httpd|apache2|nginx|lsphp[0-9]*|frankenphp|w3wp\.exe)$";
+let WebUsers = dynamic(["www-data","apache","nginx","http","wwwrun","nobody","daemon","iusr"]);
+DeviceProcessEvents
+| where Timestamp >= lookback
+| where InitiatingProcessFileName matches regex WebParents
+    or InitiatingProcessParentFileName matches regex WebParents
+    or AccountName in~ (WebUsers)
+| where ProcessCommandLine matches regex @"(?i)(/dev/(tcp|udp)/|mkfifo|fsockopen|n(c|cat)\s+.*-e\s|bash\s+-i|sh\s+-i|socat\s+.*exec)"
+    or FileName in~ ("whoami", "whoami.exe", "id", "uname", "hostname", "hostname.exe", "ipconfig.exe", "ifconfig", "systeminfo.exe")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessParentFileName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| order by Timestamp desc
+// ===== H4 PHP or script files written by web workers into web roots or temp paths
+let lookback = datetime(2026-10-20T00:00:00Z);
+let WebParents = @"(?i)^(php(-fpm|-cgi)?[0-9.]*(\.exe)?|httpd|apache2|nginx|lsphp[0-9]*|frankenphp|w3wp\.exe|sh|bash|dash|curl|wget)$";
+DeviceFileEvents
+| where Timestamp >= lookback
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName matches regex @"(?i)\.(php[0-9]?|phtml|phar)$"
+| where FolderPath has_any ("/var/www/", "/srv/www/", "/usr/share/nginx/", "public_html", "wwwroot", "/tmp/", "/var/tmp/", "/dev/shm/")
+| where InitiatingProcessFileName matches regex WebParents
+| project Timestamp, DeviceName, ActionType, FolderPath, FileName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName, SHA256
+| order by Timestamp desc
+// ===== H5 Rare outbound connections from PHP workers to public IPs
+let lookback = datetime(2026-10-20T00:00:00Z);
+let WebParents = @"(?i)^(php(-fpm|-cgi)?[0-9.]*(\.exe)?|httpd|apache2|lsphp[0-9]*|frankenphp)$";
+DeviceNetworkEvents
+| where Timestamp >= lookback
+| where ActionType == "ConnectionSuccess" and RemoteIPType == "Public"
+| where InitiatingProcessFileName matches regex WebParents
+| summarize Connections = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Ports = make_set(RemotePort, 20), Urls = make_set(RemoteUrl, 20), Devices = make_set(DeviceName, 20) by RemoteIP, InitiatingProcessFileName
+| extend DeviceCount = array_length(Devices)
+| where DeviceCount <= 2
+| order by Connections asc
+// ===== H6 New web-worker parent to child pairs vs a 28-day baseline
+let WebParents = @"(?i)^(php(-fpm|-cgi)?[0-9.]*(\.exe)?|httpd|apache2|nginx|lsphp[0-9]*|frankenphp|w3wp\.exe)$";
+let Baseline = DeviceProcessEvents
+    | where Timestamp between (ago(30d) .. ago(2d))
+    | where InitiatingProcessFileName matches regex WebParents
+    | distinct DeviceId, InitiatingProcessFileName, FileName;
+DeviceProcessEvents
+| where Timestamp > ago(2d)
+| where InitiatingProcessFileName matches regex WebParents
+| join kind=leftanti Baseline on DeviceId, InitiatingProcessFileName, FileName
+| summarize Executions = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Commands = make_set(ProcessCommandLine, 10) by DeviceName, InitiatingProcessFileName, FileName
+| order by FirstSeen desc
+// ===== H7 Persistence by the web account - cron, SSH keys, new users
+let lookback = datetime(2026-10-20T00:00:00Z);
+let WebUsers = dynamic(["www-data","apache","nginx","http","wwwrun","nobody","daemon"]);
+let ProcHits = DeviceProcessEvents
+    | where Timestamp >= lookback
+    | where AccountName in~ (WebUsers) or InitiatingProcessAccountName in~ (WebUsers)
+    | where FileName in~ ("crontab", "useradd", "adduser", "usermod", "passwd", "chpasswd")
+        or ProcessCommandLine has_any ("authorized_keys", "/etc/cron", "/var/spool/cron", "/etc/sudoers")
+    | project Timestamp, DeviceName, Signal = "process", Account = AccountName, Detail = ProcessCommandLine, Parent = InitiatingProcessFileName;
+let FileHits = DeviceFileEvents
+    | where Timestamp >= lookback
+    | where InitiatingProcessAccountName in~ (WebUsers)
+    | where FolderPath has_any ("/.ssh/authorized_keys", "/etc/cron", "/var/spool/cron", "/etc/sudoers", "/etc/systemd/system/")
+    | project Timestamp, DeviceName, Signal = "file", Account = InitiatingProcessAccountName, Detail = FolderPath, Parent = InitiatingProcessFileName;
+union ProcHits, FileHits
+| order by Timestamp desc
+// ===== H8 PHP fatal out-of-memory errors in web or PHP logs (Sentinel Syslog; adapt to your log table)
+Syslog
+| where TimeGenerated >= datetime(2026-10-20T00:00:00Z)
+| where SyslogMessage has "PHP Fatal error"
+| where SyslogMessage has "tried to allocate" and SyslogMessage has "Unknown on line 0"
+| summarize Errors = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Samples = make_set(SyslogMessage, 5) by Computer, ProcessName
+| order by Errors desc
+// ===== H9 Apache child exits (AH00052) bursts - possible exploit retries (adapt to your log table)
+Syslog
+| where TimeGenerated >= datetime(2026-10-20T00:00:00Z)
+| where SyslogMessage has "AH00052"
+| summarize Exits = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by Computer, bin(TimeGenerated, 10m)
+| where Exits >= 10
+| order by Exits desc

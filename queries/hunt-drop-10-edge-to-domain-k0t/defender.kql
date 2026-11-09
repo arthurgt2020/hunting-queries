@@ -1,0 +1,18 @@
+// k0t post-VPN hunt: NetExec/Impacket exec + RMM/Rclone. Untested: tune before use.
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| extend Hit = case(
+  FileName =~ "cmd.exe" and InitiatingProcessFileName =~ "services.exe"
+   and ProcessCommandLine contains "/Q"
+   and (ProcessCommandLine contains @"\\127.0.0.1\" or ProcessCommandLine contains "__output"), "smbexec",
+  FileName =~ "cmd.exe" and InitiatingProcessCommandLine contains "-k netsvcs"
+   and ProcessCommandLine contains @"Windows\Temp\" and ProcessCommandLine contains "&1", "atexec",
+  InitiatingProcessFileName in~ ("powershell.exe","pwsh.exe") and FileName =~ "curl.exe"
+   and ProcessCommandLine matches regex @"(?i)https?://\S+\.exe", "ps-curl-exe",
+  FileName has_any ("meshagent","anydesk","atera","teramind","ngrok"), "rmm",
+  FileName =~ "rclone.exe" or ProcessCommandLine has_any ("wasabisys.com","userstorage.mega.co.nz"), "rclone",
+  "")
+| where Hit != ""
+| summarize First=min(Timestamp), Last=max(Timestamp), N=count(), Cmd=take_any(ProcessCommandLine)
+  by DeviceName, AccountName, Hit, FileName
+| order by Last desc

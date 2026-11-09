@@ -1,0 +1,23 @@
+// Microsoft Defender (KQL) | Hunt Drop #04 | UNTESTED: tune before use
+
+// T1055: fsquirt.exe talking to the internet
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "fsquirt.exe" and RemoteIPType == "Public"
+| summarize Conns=count(), Urls=make_set(RemoteUrl,20) by DeviceName, InitiatingProcessParentFileName
+
+// T1036.005: renamed MS binary run as a service from a System32 sub-folder
+DeviceProcessEvents
+| where Timestamp > ago(14d) and InitiatingProcessFileName =~ "services.exe"
+| where FolderPath matches regex @"(?i)^c:\\windows\\system32\\[^\\]+\\[^\\]+\.exe$"
+| extend Orig = replace_regex(ProcessVersionInfoOriginalFileName, @"(?i)\.mui$", "")
+| where isnotempty(Orig) and FileName !~ Orig
+| summarize Hosts=dcount(DeviceId) by FileName, Orig, FolderPath
+
+// T1574.001: mscoree.dll loaded from a non-standard path
+DeviceImageLoadEvents
+| where Timestamp > ago(14d) and FileName =~ "mscoree.dll"
+| where not(FolderPath matches regex @"(?i)^c:\\windows\\(system32|syswow64|winsxs\\.+)\\mscoree\.dll$")
+| project Timestamp, DeviceName, FolderPath, InitiatingProcessFileName
+
+T1543.003, T1087.002, T1102.002 + IOC sweep in the files.

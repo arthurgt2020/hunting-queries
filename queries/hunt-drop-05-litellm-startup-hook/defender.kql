@@ -1,0 +1,141 @@
+// =====================================================================
+// HUNT DROP #05 | LiteLLM 1.107.0 startup-hook stealer (PRIVCOLLECT)
+// Builds on Intel Drop #13 | Microsoft Defender XDR - Advanced Hunting (KQL)
+// Author: Arthur Thomas (draft) | TLP:CLEAR
+// STATUS: UNTESTED in a live tenant. Run as hunts first; test and tune
+//         before promoting anything to a custom detection rule.
+// Window: 14 days by default (covers the 21 Oct 2026 exposure window).
+// Tables used (schema checked on Microsoft Learn, 26 Oct 2026):
+//   DeviceProcessEvents, DeviceFileEvents, DeviceNetworkEvents
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// H0 - Exposure scoping: who pulled LiteLLM during / around the window
+// ATT&CK: T1195.001 (Compromise Software Dependencies and Dev Tools)
+// Hypothesis: Hosts that ran pip/uv/poetry/docker for litellm on 21 Oct
+//   (approx. 11:39-14:20 UTC) or pinned 1.107.0 may hold the bad build.
+// Expected noise: Low-Medium (AI/dev teams install LiteLLM legitimately;
+//   presence = exposure, not compromise).
+// ---------------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessCommandLine has "litellm"
+| where ProcessCommandLine has_any ("pip", "pip3", "uv", "poetry", "pipx", "docker", "podman")
+     or ProcessCommandLine contains "ghcr.io/berriai"
+| extend PinnedBad = ProcessCommandLine has "1.107.0"
+| extend InWindow = Timestamp between (datetime(2026-10-21 11:00:00) .. datetime(2026-10-21 15:00:00))
+| where PinnedBad or InWindow or ProcessCommandLine has_any ("latest", "main-stable", "main-latest")
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine,
+          InitiatingProcessFileName, PinnedBad, InWindow
+| order by Timestamp asc
+
+
+// ---------------------------------------------------------------------
+// H1 - Python startup-hook implant written into a library directory
+// ATT&CK: T1546.018 (Python Startup Hooks), T1195.001
+// Hypothesis: If the 1.107.0 wheel was installed, cook.pth / cook.py /
+//   sitecustomize.py land in site-packages/dist-packages OUTSIDE the
+//   litellm folder, written by pip/uv/python.
+// Expected noise: Medium - package managers write legitimate .pth files.
+//   Allow-list below is a starting point; build your own by prevalence.
+// ---------------------------------------------------------------------
+let knownPth = dynamic(["distutils-precedence.pth", "easy-install.pth", "_virtualenv.pth", "pywin32.pth"]);
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any ("site-packages", "dist-packages", "purelib")
+| where FileName in~ ("cook.pth", "cook.py", "sitecustomize.py")
+     or (FileName endswith ".pth"
+         and not(FileName in~ (knownPth))
+         and not(FileName startswith "__editable__")
+         and not(FileName endswith "-nspkg.pth"))
+| extend Signal = case(FileName in~ ("cook.pth", "cook.py"), "1-LiteLLM implant file name",
+                       FileName =~ "sitecustomize.py", "2-sitecustomize.py written",
+                       "3-Uncommon .pth startup hook")
+| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            Files = make_set(FileName, 20), Paths = make_set(FolderPath, 20),
+            Writers = make_set(InitiatingProcessCommandLine, 10)
+            by DeviceName, Signal
+| order by Signal asc, FirstSeen desc
+// Rarity tip: for Signal 3, keep only .pth names seen on <= 2 devices:
+// | join kind=inner (DeviceFileEvents | where Timestamp > ago(30d) and FileName endswith ".pth"
+//     | summarize Devices = dcount(DeviceId) by FileName | where Devices <= 2) on FileName
+
+
+// ---------------------------------------------------------------------
+// H2 - Python spawning crypto staging, inline DB theft or discovery
+// ATT&CK: T1059.006, T1027.013, T1552.001, T1082, T1016
+// Hypothesis: The collector runs inside Python and spawns (a) openssl
+//   using ".pc_e_" staging paths (enc -aes-256-cbc / pkeyutl / rsautl),
+//   (b) an inline python -c Prisma query of LiteLLM_CredentialsTable /
+//   LiteLLM_ProxyModelTable, (c) on Windows a burst of systeminfo,
+//   ipconfig, route, arp, netstat.
+// Expected noise: Low for (a) and (b); Medium for (c) (dev tooling and
+//   IT scripts run network commands from Python - require >= 3 distinct).
+// ---------------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName matches regex @"(?i)^(python|pythonw|platform-python|python3(\.\d+)?)(\.exe)?$"
+| extend Cmd = tolower(ProcessCommandLine)
+| extend Signal = case(
+      FileName in~ ("openssl", "openssl.exe") and Cmd contains ".pc_e_", "OpenSSL .pc_e_ staging (T1027.013)",
+      (Cmd contains "litellm_credentialstable" or Cmd contains "litellm_proxymodeltable") and Cmd contains "query_raw", "Inline LiteLLM DB pull (T1552.001)",
+      FileName in~ ("systeminfo.exe", "ipconfig.exe", "route.exe", "arp.exe", "netstat.exe"), "Discovery child (T1082/T1016)",
+      "")
+| where isnotempty(Signal)
+| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            HighSignals = countif(Signal !startswith "Discovery"),
+            DiscoveryKinds = dcountif(FileName, Signal startswith "Discovery"),
+            Signals = make_set(Signal), Samples = make_set(ProcessCommandLine, 5)
+            by DeviceName, InitiatingProcessId, InitiatingProcessCommandLine
+| where HighSignals > 0 or DiscoveryKinds >= 3
+| order by HighSignals desc, FirstSeen asc
+
+
+// ---------------------------------------------------------------------
+// H3 - Python interpreter egress: dead-drop, exfil host, metadata API
+// ATT&CK: T1102.001 (Dead Drop Resolver), T1105, T1552.005
+// Hypothesis: An infected interpreter reaches raw.githubusercontent.com
+//   (dead-drop pointer), the exfil host, and on workstations the
+//   169.254.169.254 instance-metadata address it should never need.
+// Expected noise: Medium-High for raw GitHub and metadata on cloud VMs
+//   and build agents; treat those as context, pivot from H1/H2 hits.
+// ---------------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName matches regex @"(?i)^(python|pythonw|platform-python|python3(\.\d+)?)(\.exe)?$"
+| extend U = tolower(RemoteUrl)
+| extend Signal = case(
+      U contains "litellm.dev", "1-IOC exfil host",
+      U contains "letters9813", "1-IOC dead-drop repo",
+      U contains "raw.githubusercontent.com", "2-Python to raw GitHub (dead-drop pattern)",
+      RemoteIP == "169.254.169.254", "3-Python to instance metadata",
+      "")
+| where isnotempty(Signal)
+| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Conns = count(),
+            Urls = make_set(RemoteUrl, 10), Cmds = make_set(InitiatingProcessCommandLine, 5)
+            by DeviceName, Signal
+| order by Signal asc, Conns desc
+
+
+// ---------------------------------------------------------------------
+// IOC SWEEP (published by Microsoft and Socket, Oct 2026)
+// Low noise; indicators expire fast - use for retro-scoping only.
+// ---------------------------------------------------------------------
+let startupHashes = dynamic([
+  "9dd0a3926f96a37eb86cf1ee2310d9be93139cc4ebef3ef9e2efe9531390be25",
+  "03ac2a8b752605d1d7710979c17ff18b03dd978203ba23ba97fd8ce3d6f897ea",
+  "34bef04fe88ac9d0aae0475630b1738681d15b94f233ac8aa46eacf5968305fa",
+  "b6122440d0d9cb1eb1ade9933f49214da8c31288de7710c076c2680dfa528465",
+  "7f191632e7320705d154b85204f1ae546b543acbd7e8861229b76f5042b92bdb",
+  "84dc8c82c0a4a4a62552ef826b49fcc86d1a5c4a5d0f2c06665723f93d129d7d"]);
+let markerFiles = dynamic([".pc_once_72129118c59f5636c0bb", "remote_code_loader.lock"]);
+union
+  (DeviceFileEvents | where Timestamp > ago(14d)
+     | where SHA256 in (startupHashes) or FileName in (markerFiles)
+     | project Timestamp, DeviceName, Hit = strcat("File: ", FolderPath), InitiatingProcessCommandLine),
+  (DeviceNetworkEvents | where Timestamp > ago(14d)
+     | where RemoteUrl contains "litellm.dev" or RemoteUrl contains "letters9813"
+     | project Timestamp, DeviceName, Hit = strcat("Net: ", RemoteUrl), InitiatingProcessCommandLine)
+| order by Timestamp asc

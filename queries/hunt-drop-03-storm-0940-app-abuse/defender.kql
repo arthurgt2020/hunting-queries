@@ -1,0 +1,20 @@
+// Microsoft Defender (KQL) | Hunt Drop #03 | UNTESTED: tune before use
+
+// T1078.004/T1528: app-only sign-ins from IPs new for that app
+let w=10d;
+let Base=EntraIdSpnSignInEvents
+| where Timestamp between (ago(30d)..ago(w)) and ErrorCode==0
+| distinct ServicePrincipalId, IPAddress;
+EntraIdSpnSignInEvents
+| where Timestamp > ago(w) and ErrorCode==0 and IsManagedIdentity==false
+| join kind=leftanti Base on ServicePrincipalId, IPAddress
+| summarize SignIns=count(), IPs=make_set(IPAddress,20), UAs=make_set(UserAgent,10) by Application, ApplicationId, ServicePrincipalId
+
+// T1098.003: apps assigning directory/app roles
+GraphAPIAuditEvents
+| where Timestamp > ago(14d)
+| where RequestMethod in~ ("POST","PATCH","PUT") and ResponseStatusCode startswith "2"
+| where RequestUri contains "roleManagement/directory/role" or RequestUri has_any ("directoryRoles","appRoleAssignedTo","appRoleAssignments")
+| summarize Calls=count(), IPs=make_set(IpAddress,10), Uris=make_set(RequestUri,10) by ApplicationId, ServicePrincipalId
+
+10 technique-mapped hunts (T1199, T1110.003, T1087.004, T1098.001, T1580, T1555.006...) in the Hunt Drop #03 files.

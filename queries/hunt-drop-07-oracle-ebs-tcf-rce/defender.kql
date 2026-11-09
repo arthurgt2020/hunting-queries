@@ -1,0 +1,107 @@
+// =====================================================================
+// HUNT DROP #07 | Oracle EBS CVE-2026-101767 (TCF servlet SQLi -> RCE)
+// Builds on Intel Drop #21 | Microsoft Defender XDR Advanced Hunting
+// Author: Arthur Thomas (draft) | TLP:CLEAR
+// STATUS: UNTESTED in a live tenant. Test and tune before any use as a
+// detection. Requires Defender for Endpoint P2 sensors on the Linux EBS
+// application-tier hosts (no sensor = no telemetry = no result).
+// Default window: 14 days (Timestamp > ago(14d)).
+// EDIT FIRST: EbsAccounts, EbsHosts, ApplPtmp to match your estate.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// H1 | EBS Java tier spawns a shell
+// ATT&CK: T1190 (Exploit Public-Facing Application), T1059.004 (Unix Shell)
+// Hypothesis: if CVE-2026-101767 (or another EBS RCE) was used against us,
+//   the EBS Java process starts sh/bash on the app tier.
+// Expected noise: Low-Medium. Some admin/WebLogic scripts may do this;
+//   baseline per host and allow-list by exact command line.
+// ---------------------------------------------------------------------
+let EbsHosts = dynamic(["ebs-app01","ebs-app02"]);   // EDIT: EBS app-tier DeviceName values
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where DeviceName has_any (EbsHosts)
+| where InitiatingProcessFileName =~ "java"
+| where FileName in~ ("sh","bash","dash","ksh")
+| extend Suspicious = ProcessCommandLine has_any ("/dev/tcp","bash -i","base64","curl","wget","whoami","uname","ifconfig","ip addr","netstat","/proc/net/arp","/etc/hosts","/etc/fstab")
+| summarize Hits = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            Cmds = make_set(ProcessCommandLine, 25)
+            by DeviceName, InitiatingProcessAccountName, AccountName, Suspicious
+| order by Suspicious desc, Hits asc
+
+
+// ---------------------------------------------------------------------
+// H2 | EBS OS account runs host recon or a reverse shell
+// ATT&CK: T1059.004, T1082 (System Information Discovery),
+//         T1016 (System Network Configuration Discovery),
+//         T1049 (System Network Connections Discovery), T1057 (Process Discovery)
+// Hypothesis: after SQLi -> OS command execution, the EBS application
+//   account (e.g. oracle / applmgr) runs recon commands or opens a
+//   /dev/tcp reverse shell. Horizon3 says the oracle account spawns
+//   /bin/sh via the Concurrent Manager, so do NOT filter on parent.
+// Expected noise: Medium. Concurrent Manager host programs and DBA
+//   scripts run under these accounts; triage by rarity per host.
+// ---------------------------------------------------------------------
+let EbsAccounts = dynamic(["oracle","applmgr"]);     // EDIT: your EBS OS accounts
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where AccountName in~ (EbsAccounts) or InitiatingProcessAccountName in~ (EbsAccounts)
+| where ProcessCommandLine matches regex @"(?i)(/dev/tcp/|bash\s+-i|\bip\s+addr\b|\bifconfig\b|netstat\s+-an|\barp\s+-a\b|/proc/net/arp|cat\s+/etc/(hosts|fstab)|ps\s+-?aux|\bwhoami\b)"
+| summarize Hits = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            Parents = make_set(InitiatingProcessFileName, 10),
+            Cmds = make_set(ProcessCommandLine, 25)
+            by DeviceName, AccountName
+| order by Hits asc
+
+
+// ---------------------------------------------------------------------
+// H3a | New files dropped in $APPLPTMP by EBS accounts
+// ATT&CK: T1190 (post-exploitation artefact; analyst mapping)
+// Hypothesis: exploitation leaves unexpected files in $APPLPTMP
+//   (Horizon3 indicator).
+// Expected noise: High. $APPLPTMP is a working temp dir for EBS; use as
+//   a pivot around H1/H2 hits, not as a standalone alert.
+// NOTE: ActionType value "FileCreated" not listed on the MS Learn schema
+//   page; confirm in the in-portal schema reference.
+// ---------------------------------------------------------------------
+let ApplPtmp = "/CHANGE/ME/applptmp/";               // EDIT: value of $APPLPTMP on your app tier
+let EbsAccounts = dynamic(["oracle","applmgr"]);
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath startswith ApplPtmp
+| where ActionType == "FileCreated"
+| where InitiatingProcessAccountName in~ (EbsAccounts)
+| summarize Files = make_set(FileName, 50), Writers = make_set(InitiatingProcessFileName, 10),
+            Count = count() by DeviceName, bin(Timestamp, 1h)
+| order by Timestamp desc
+
+
+// ---------------------------------------------------------------------
+// H3b | EBS app tier talks to the internet (Java or shell)
+// ATT&CK: T1071.001 (Web Protocols), T1571 (Non-Standard Port) - analyst mapping
+// Hypothesis: a foothold on EBS calls out for a second stage or a reverse
+//   shell. Background: in the 2025 EBS campaign, Google/Mandiant saw Java
+//   implants beaconing on 443 and a bash reverse shell to TCP/53.
+// Expected noise: Low if EBS egress is already restricted; Medium otherwise
+//   (licence checks, patch downloads, integrations - allow-list them).
+// NOTE: RemoteIPType value "Public" not listed on the MS Learn schema page;
+//   confirm in-portal.
+// ---------------------------------------------------------------------
+let EbsHosts = dynamic(["ebs-app01","ebs-app02"]);   // EDIT
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where DeviceName has_any (EbsHosts)
+| where RemoteIPType == "Public"
+| where InitiatingProcessFileName in~ ("java","sh","bash","dash","ksh","curl","wget","nc","ncat")
+| summarize Conns = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            Ports = make_set(RemotePort, 20), Urls = make_set(RemoteUrl, 20)
+            by DeviceName, InitiatingProcessFileName, InitiatingProcessAccountName, RemoteIP
+| order by Conns asc
+
+
+// ---------------------------------------------------------------------
+// IOC SWEEP: none. Oracle, Horizon3 and the reporting reviewed publish no
+// IOCs for CVE-2026-101767 (as of 30 Oct 2026). The 2025 CL0P/EBS IOCs are
+// a different campaign and are deliberately NOT swept here.
+// ---------------------------------------------------------------------
