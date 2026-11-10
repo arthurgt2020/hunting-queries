@@ -10,7 +10,7 @@
 //            at a time in Advanced Hunting.
 // NOTE     : Flag regexes accept "-", "/" and the en/em/horizontal-bar dashes
 //            that PowerShell also accepts (Sigma "windash" equivalent).
-// Author   : Arthur Thomas (draft) | TLP:CLEAR
+// Author   : Arthur T. (draft) | TLP:CLEAR
 // =====================================================================
 
 
