@@ -6,7 +6,7 @@ These queries are untested in your environment. Treat them as hunts and tune the
 
 | Drop | Title | ATT&CK | KQL | CQL |
 |---|---|---|---|---|
-| 12 | [Hunting Operation Snowball: AI-run relays and shells](queries/hunt-drop-12-operation-snowball/) | T1047, T1059.001, T1105, T1090, T1505.003, T1548.003, T1543.002 |  |  |
+| 12 | [Hunting Operation Snowball: AI-run relays and shells](queries/hunt-drop-12-operation-snowball/) | T1047, T1059.001, T1105, T1090, T1505.003, T1548.003, T1543.002 | yes | yes |
 | 10 | [Edge-to-Domain: Hunting the k0t Post-VPN Playbook](queries/hunt-drop-10-edge-to-domain-k0t/) | T1569.002, T1053.005, T1059.001, T1219, T1567.002 | yes | yes |
 | 9 | [LLMJacking: find the hijacked AI before the bill does](queries/hunt-drop-09-llmjacking/) | T1078.004, T1580, T1562.008, T1496.004, T1136.003, T1098.001, T1098.003 | yes | yes |
 | 8 | [Trojanised Claude Code extension: hunt the reverse SSH backdoor](queries/hunt-drop-08-claude-code-extension/) | T1572, T1098.004, T1053.005, T1543.001, T1547.001, T1053.003, T1071.001 | yes | yes |

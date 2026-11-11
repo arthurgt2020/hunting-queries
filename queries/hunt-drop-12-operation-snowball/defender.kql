@@ -1,0 +1,21 @@
+// H1 WMI → hidden/encoded PowerShell relay (T1047, T1059.001)
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("powershell.exe","pwsh.exe")
+| where InitiatingProcessFileName =~ "wmiprvse.exe"
+| where ProcessCommandLine matches regex @"(?i)\s-(e|enc|encodedcommand)\s|\s-w(indowstyle)?\s+hidden"
+| summarize Execs=count(), Cmds=make_set(ProcessCommandLine,5) by DeviceName
+
+// H2 PowerShell/Perl → public TCP 21 (T1090)
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemotePort == 21 and RemoteIPType == "Public"
+| where InitiatingProcessFileName in~ ("powershell.exe","pwsh.exe") or InitiatingProcessFileName startswith "perl"
+| summarize Conns=count(), IPs=make_set(RemoteIP,10) by DeviceName, InitiatingProcessFileName
+
+// H3 java/w3wp → shell (T1505.003)
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where (InitiatingProcessFileName =~ "java" and FileName in~ ("sh","bash","dash","perl"))
+   or (InitiatingProcessFileName =~ "w3wp.exe" and FileName in~ ("cmd.exe","powershell.exe"))
+| summarize Execs=count(), Cmds=make_set(ProcessCommandLine,5) by DeviceName, FileName

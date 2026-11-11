@@ -4,7 +4,7 @@
 
 **ATT&CK:** T1047, T1059.001, T1105, T1090, T1505.003, T1548.003, T1543.002
 **Date:** 2026-11-11
-**Queries:** see the write-up
+**Queries:** [defender.kql](defender.kql), [falcon.cql](falcon.cql)
 
 Write-up: https://arkknight.si/hunting/hunt-drop-12-operation-snowball/
 
